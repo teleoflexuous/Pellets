@@ -1,1 +1,1 @@
-# Pellets
+Pellets is a Python library for managing LLM prompts.
