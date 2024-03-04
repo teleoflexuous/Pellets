@@ -1,52 +1,55 @@
-from pydantic import (
-    BaseModel,
-    Field,
-    validator,
-    UUID4,
-    ConfigDict,
-    SecretStr,
-    create_model,
-)
+from pydantic import BaseModel, Field, UUID4, Json, ConfigDict
+from typing import Any
 import uuid
 
-from pellets.config import config
 
-PromptArgumentsCreate = create_model(
-    "PromptArgumentsCreate",
-    # add from_attributes=True to configdict
-    **config.prompt_arguments_schema,
-    __config__=ConfigDict(from_attributes=True)
-)
+class PromptArgumentsCreate(BaseModel):
+    model_config = ConfigDict(
+        from_attributes=True,
+    )
 
-PromptArgumentsRecord = create_model(
-    "PromptArguments",
-    id=(
-        UUID4,
-        Field(description="The unique identifier for the prompt arguments"),
-    ),
-    # add from_attributes=True to configdict
-    **config.prompt_arguments_schema,
-    __config__=ConfigDict(from_attributes=True)
-)
+    model: str = Field(description="The model to use for the prompt")
+    prompt: str = Field(description="The prompt to use for the model")
+    parameters: dict[str, Any] = Field(
+        default_factory=dict,
+        description="The parameters to use for the model",
+    )
 
-ResponseCreate = create_model(
-    "ResponseCreate",
-    # add from_attributes=True to configdict
-    **config.response_schema,
-    # Relationship between the prompt arguments and the response
-    prompt_arguments_id=(UUID4, Field(description="The unique identifier for the prompt arguments")),
-    __config__=ConfigDict(from_attributes=True)
-)
 
-ResponseRecord = create_model(
-    "Response",
-    id=(
-        UUID4,
-        Field(description="The unique identifier for the response"),
-    ),
-    # add from_attributes=True to configdict
-    **config.response_schema,
-    # Relationship between the prompt arguments and the response
-    prompt_arguments_id=(UUID4, Field(description="The unique identifier for the prompt arguments")),
-    __config__=ConfigDict(from_attributes=True)
-)
+class PromptArgumentsRecord(PromptArgumentsCreate):
+    id: UUID4 = Field(
+        default_factory=uuid.uuid4,
+        description="The unique identifier for the prompt arguments",
+    )
+
+
+class ResponseCreate(BaseModel):
+    model_config = ConfigDict(
+        from_attributes=True,
+    )
+    response: str = Field(description="The response to the prompt")
+    prompt_arguments_id: UUID4 = Field(
+        description="The unique identifier for the prompt arguments",
+    )
+
+
+class ResponseRecord(ResponseCreate):
+    id: UUID4 = Field(
+        default_factory=uuid.uuid4, description="The unique identifier for the response"
+    )
+
+
+class ResponseStreamCreate(ResponseCreate):
+    id: UUID4 = Field(
+        default_factory=uuid.uuid4, description="The unique identifier for the response"
+    )
+    previous_response_id: UUID4 = Field(
+        description="The unique identifier for the previous response",
+    )
+    done: bool = Field(description="Whether the response stream is done")
+
+
+class ResponseStreamRecord(ResponseStreamCreate):
+    id: UUID4 = Field(
+        default_factory=uuid.uuid4, description="The unique identifier for the response"
+    )
