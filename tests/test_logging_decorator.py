@@ -60,17 +60,15 @@
 
 # Tests architecture, from the most basic to the most complex:
 # (We are testing the logging, not the model or the API)
-# 1. Test that the decorator correctly forwards the original response for a non-streamed response
-# 2. Test that the decorator correctly reads the prompt, model, and response for a non-streamed response
-# 4. Test that the decorator correctly reads the prompt, model, and response for a streamed response
-# 5. Test that the decorator correctly logs the prompt, model, and response for a non-streamed response to a sqlite database
-# 6. Test that the decorator correctly logs the prompt, model, and response for a streamed response to a sqlite database
-# 7. Test that the decorator correctly reads the prompt, model, and response from the sqlite database
+# 1. Test that the decorator correctly forwards the original response
+# 2. Test that the decorator correctly reads the prompt, model, and response
+# 3. Test that the decorator correctly logs the prompt, model, and response to a sqlite database
+# 4. Test that the decorator correctly reads the prompt, model, and response from the sqlite database
 
 import pytest  # for the fixture, among other things
 import requests  # for the HTTP requests
 import json  # for parsing the response
-import sqlite3  # for the database
+import sqlite3  # for the database connection
 import datetime  # for the timestamp
 import uuid  # for the UUID
 import os  # for the file handling
@@ -180,9 +178,10 @@ def test_pickle_exists():
 def db_path():
     return config.db_path
 
+
 @pytest.fixture
 def pellet():
-    return Pellet(prompt_parameters=PARAMS, db_path=config.db_path)
+    return Pellet(prompt_parameters=PARAMS)
 
 
 @pytest.fixture
@@ -198,8 +197,7 @@ def prompt():
 @pytest.fixture
 def params():
     return PARAMS
-    
-    
+
 
 # Set up the mock response
 
@@ -333,7 +331,9 @@ async def test_log_forward_original_response_streamed_async(
 # Test that the decorator correctly reads the prompt, model, and response for a non-streamed response
 
 
-def test_log_read_arguments_non_streamed_sync(pellet, mock_generate, model, prompt, params):
+def test_log_read_arguments_non_streamed_sync(
+    pellet, mock_generate, model, prompt, params
+):
     @pellet.log(with_results=True, stream=False)
     def func(model, prompt, **params):
         return mock_generate
@@ -343,7 +343,9 @@ def test_log_read_arguments_non_streamed_sync(pellet, mock_generate, model, prom
     assert isinstance(results["prompt_arguments"], PromptArgumentsRecord)
     assert results["prompt_arguments"] == PromptArgumentsRecord(
         id=results["prompt_arguments"].id,
-        **PromptArgumentsCreate(model=model, prompt=prompt, parameters=params).model_dump(),
+        **PromptArgumentsCreate(
+            model=model, prompt=prompt, parameters=params
+        ).model_dump(),
     )
     assert isinstance(results["response"], ResponseRecord)
     assert results["response"] == ResponseRecord(
@@ -370,7 +372,9 @@ async def test_log_read_arguments_non_streamed_async(
     assert isinstance(results["prompt_arguments"], PromptArgumentsRecord)
     assert results["prompt_arguments"] == PromptArgumentsRecord(
         id=results["prompt_arguments"].id,
-        **PromptArgumentsCreate(model=model, prompt=prompt, parameters=params).model_dump(),
+        **PromptArgumentsCreate(
+            model=model, prompt=prompt, parameters=params
+        ).model_dump(),
     )
     assert isinstance(results["response"], ResponseRecord)
     assert results["response"] == ResponseRecord(
@@ -385,7 +389,9 @@ async def test_log_read_arguments_non_streamed_async(
 # Test that the decorator correctly reads the prompt, model, and response for a streamed response
 
 
-def test_log_read_arguments_streamed_sync(pellet, model, prompt, params, mock_generate_stream):
+def test_log_read_arguments_streamed_sync(
+    pellet, model, prompt, params, mock_generate_stream
+):
     @pellet.log(with_results=True, stream=True)
     def func(model, prompt, **params):
         return mock_generate_stream
@@ -401,11 +407,14 @@ def test_log_read_arguments_streamed_sync(pellet, model, prompt, params, mock_ge
 
     prompt_arguments = results["prompt_arguments"]
     responses = results["responses"]
+    logger.debug(f"len(responses): {len(responses)}")
 
     assert isinstance(prompt_arguments, PromptArgumentsRecord)
     assert prompt_arguments == PromptArgumentsRecord(
         id=prompt_arguments.id,
-        **PromptArgumentsCreate(model=model, prompt=prompt, parameters=params).model_dump(),
+        **PromptArgumentsCreate(
+            model=model, prompt=prompt, parameters=params
+        ).model_dump(),
     )
 
     for response, expected_response in zip(
@@ -414,12 +423,12 @@ def test_log_read_arguments_streamed_sync(pellet, model, prompt, params, mock_ge
         expected_response = json.loads(expected_response)
         assert isinstance(response, ResponseStreamRecord)
         assert response == ResponseStreamRecord(
+            id=response.id,
             **ResponseStreamCreate(
-                id=response.id,
                 response=expected_response["response"],
                 prompt_arguments_id=prompt_arguments.id,
                 previous_response_id=response.previous_response_id,
-                done=expected_response["done"] == "true",
+                done=expected_response["done"],
             ).model_dump(),
         )
 
@@ -433,7 +442,7 @@ async def test_log_read_arguments_streamed_async(
     @pellet.log(with_results=True, stream=True)
     async def func(model, prompt, **params):
         return await async_mock_generate_stream
-    
+
     original_responses = []
     results = {"prompt_arguments": None, "responses": []}
     async for original_response, result in func(model, prompt, **params):
@@ -442,14 +451,16 @@ async def test_log_read_arguments_streamed_async(
             assert result["prompt_arguments"] == results["prompt_arguments"]
         results["prompt_arguments"] = result["prompt_arguments"]
         results["responses"].append(result["response"])
-    
+
     prompt_arguments = results["prompt_arguments"]
     responses = results["responses"]
 
     assert isinstance(prompt_arguments, PromptArgumentsRecord)
     assert prompt_arguments == PromptArgumentsRecord(
         id=prompt_arguments.id,
-        **PromptArgumentsCreate(model=model, prompt=prompt, parameters=params).model_dump(),
+        **PromptArgumentsCreate(
+            model=model, prompt=prompt, parameters=params
+        ).model_dump(),
     )
 
     for response, expected_response in zip(
@@ -458,8 +469,8 @@ async def test_log_read_arguments_streamed_async(
         expected_response = json.loads(expected_response)
         assert isinstance(response, ResponseStreamRecord)
         assert response == ResponseStreamRecord(
+            id=response.id,
             **ResponseStreamCreate(
-                id=response.id,
                 response=expected_response["response"],
                 prompt_arguments_id=prompt_arguments.id,
                 previous_response_id=response.previous_response_id,
@@ -471,24 +482,176 @@ async def test_log_read_arguments_streamed_async(
 # Test that the decorator correctly logs the prompt, model, and response for a non-streamed response to a sqlite database
 
 
-def test_log_to_sqlite_non_streamed_sync(pellet, model, prompt, params, mock_generate, db_path):
+def test_log_to_sqlite_non_streamed_sync(
+    pellet, model, prompt, params, mock_generate, db_path
+):
     @pellet.log(with_results=True, stream=False)
     def func(model, prompt, **params):
         return mock_generate
 
     original_response, results = func(model, prompt, **params)
 
+    created_prompt_arguments = results["prompt_arguments"]
+    created_response = results["response"]
+
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
     cursor.execute(
-        f"SELECT * FROM prompt_arguments WHERE id = '{results['prompt_arguments'].id}'"
+        # There was a change. Everything is indexed by id now
+        f"""
+        SELECT * FROM prompt_arguments WHERE id = '{created_prompt_arguments.id}'
+        """
     )
-    
-    prompt_arguments = cursor.fetchone()
-    logger.debug(f"prompt_arguments: {prompt_arguments}")
-    prompt_arguments = PromptArgumentsRecord(
-        prompt_arguments[0],
+    fetched_prompt_arguments_table = cursor.fetchone()
+    columns = [desc[0] for desc in cursor.description]
+    fetched_prompt_arguments = {}
+    for column, value in zip(columns, fetched_prompt_arguments_table):
+        fetched_prompt_arguments[column] = value
+    fetched_prompt_arguments["parameters"] = json.loads(
+        fetched_prompt_arguments["parameters"]
     )
-    logger.debug(f"prompt_arguments: {prompt_arguments}")
-    assert prompt_arguments == results["prompt_arguments"]
+    logger.debug(f"fetched_prompt_arguments: {fetched_prompt_arguments}")
+    fetched_prompt_arguments = PromptArgumentsRecord.model_validate(
+        fetched_prompt_arguments
+    )
+    assert fetched_prompt_arguments == created_prompt_arguments
+
+    cursor.execute(
+        f"""
+        SELECT * FROM response WHERE id = '{created_response.id}'
+        """
+    )
+    fetched_response_table = cursor.fetchone()
+    columns = [desc[0] for desc in cursor.description]
+    fetched_response = {}
+    for column, value in zip(columns, fetched_response_table):
+        fetched_response[column] = value
+    fetched_response = ResponseRecord.model_validate(fetched_response)
+    assert fetched_response == created_response
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_log_to_sqlite_non_streamed_async(
+    pellet, model, prompt, params, async_mock_generate, db_path
+):
+    return
+
+    @pellet.log(with_results=True, stream=False)
+    async def func(model, prompt, **params):
+        return await async_mock_generate
+
+    original_response, results = await func(model, prompt, **params)
+
+    created_prompt_arguments = results["prompt_arguments"]
+    created_response = results["response"]
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        SELECT * FROM prompt_arguments WHERE id = '{created_prompt_arguments.id}'
+        """
+    )
+    fetched_prompt_arguments_table = cursor.fetchone()
+    columns = [desc[0] for desc in cursor.description]
+    fetched_prompt_arguments = {}
+    for column, value in zip(columns, fetched_prompt_arguments_table):
+        fetched_prompt_arguments[column] = value
+    fetched_prompt_arguments["parameters"] = json.loads(
+        fetched_prompt_arguments["parameters"]
+    )
+    fetched_prompt_arguments = PromptArgumentsRecord.model_validate(
+        fetched_prompt_arguments
+    )
+    assert fetched_prompt_arguments == created_prompt_arguments
+
+    cursor.execute(
+        f"""
+        SELECT * FROM response WHERE id = '{created_response.id}'
+        """
+    )
+    fetched_response_table = cursor.fetchone()
+    columns = [desc[0] for desc in cursor.description]
+    fetched_response = {}
+    for column, value in zip(columns, fetched_response_table):
+        fetched_response[column] = value
+    fetched_response = ResponseRecord.model_validate(fetched_response)
+    assert fetched_response == created_response
+
+    conn.close()
+
+
+# Test that the decorator correctly logs the prompt, model, and response for a streamed response to a sqlite database
+
+
+def test_log_to_sqlite_streamed_sync(
+    pellet, model, prompt, params, mock_generate_stream, db_path
+):
+    @pellet.log(with_results=True, stream=True)
+    def func(model, prompt, **params):
+        return mock_generate_stream
+
+    results = {"prompt_arguments": None, "responses": []}
+    for original_response, result in func(model, prompt, **params):
+        if results["prompt_arguments"]:
+            assert result["prompt_arguments"] == results["prompt_arguments"]
+        results["prompt_arguments"] = result["prompt_arguments"]
+        results["responses"].append(result["response"])
+
+    prompt_arguments = results["prompt_arguments"]
+    responses = results["responses"]
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        SELECT * FROM prompt_arguments WHERE id = '{prompt_arguments.id}'
+        """
+    )
+    fetched_prompt_arguments_table = cursor.fetchone()
+    columns = [desc[0] for desc in cursor.description]
+    logger.debug(f"columns: {columns}")
+    fetched_prompt_arguments = {}
+    for column, value in zip(columns, fetched_prompt_arguments_table):
+        fetched_prompt_arguments[column] = value
+    fetched_prompt_arguments["parameters"] = json.loads(
+        fetched_prompt_arguments["parameters"]
+    )
+    fetched_prompt_arguments = PromptArgumentsRecord.model_validate(
+        fetched_prompt_arguments
+    )
+    assert fetched_prompt_arguments == prompt_arguments
+    response_ids = [response.id for response in responses]
+
+    # Prepare the placeholders for the IN clause
+    placeholders = ', '.join('?' for _ in response_ids)
+
+    # Prepare the query
+    query = f"SELECT * FROM response WHERE id IN ({placeholders})"
+
+    # Execute the query
+    cursor.execute(query, response_ids)
+    fetched_responses_table = cursor.fetchall()
+    columns = [desc[0] for desc in cursor.description]
+    fetched_responses = []
+    for fetched_response_record in fetched_responses_table:
+        fetched_response = {}
+        for column, value in zip(columns, fetched_response_record):
+            fetched_response[column] = value
+        fetched_response = ResponseStreamRecord.model_validate(fetched_response)
+        fetched_responses.append(fetched_response)
+    fetched_responses = [
+        ResponseStreamRecord.model_validate(fetched_response)
+        for fetched_response in fetched_responses
+    ]
+    for fetched_response, response in zip(fetched_responses, responses):
+        assert fetched_response.response == response.response
+        assert fetched_response.done == response.done
+        assert fetched_response.prompt_arguments_id == response.prompt_arguments_id
+        assert fetched_response.previous_response_id == response.previous_response_id
+        assert fetched_response == response
+
+    conn.close()

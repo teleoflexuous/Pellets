@@ -17,8 +17,7 @@ class PromptArgumentsCreate(BaseModel):
 
 
 class PromptArgumentsRecord(PromptArgumentsCreate):
-    id: UUID4 = Field(
-        default_factory=uuid.uuid4,
+    id: int = Field(
         description="The unique identifier for the prompt arguments",
     )
 
@@ -28,28 +27,26 @@ class ResponseCreate(BaseModel):
         from_attributes=True,
     )
     response: str = Field(description="The response to the prompt")
-    prompt_arguments_id: UUID4 = Field(
+    prompt_arguments_id: int = Field(
         description="The unique identifier for the prompt arguments",
     )
 
 
 class ResponseRecord(ResponseCreate):
-    id: UUID4 = Field(
-        default_factory=uuid.uuid4, description="The unique identifier for the response"
+    id: int = Field(
+        description="The unique identifier for the response",
     )
 
 
 class ResponseStreamCreate(ResponseCreate):
-    id: UUID4 = Field(
-        default_factory=uuid.uuid4, description="The unique identifier for the response"
-    )
-    previous_response_id: UUID4 = Field(
+    previous_response_id: int | None = Field(
+        default=None,
         description="The unique identifier for the previous response",
     )
     done: bool = Field(description="Whether the response stream is done")
 
 
 class ResponseStreamRecord(ResponseStreamCreate):
-    id: UUID4 = Field(
-        default_factory=uuid.uuid4, description="The unique identifier for the response"
+    id: int = Field(
+        description="The unique identifier for the response stream",
     )

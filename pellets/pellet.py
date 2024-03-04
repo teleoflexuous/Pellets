@@ -8,7 +8,6 @@ import sqlite3
 import json
 import pydantic
 import asyncio
-import uuid
 import inspect
 from typing import Type, List, Callable, Generator, Union, Tuple, AsyncGenerator, Dict
 from itertools import chain
@@ -32,27 +31,32 @@ class Pellet:
         self,
         db_path: str = config.db_path,
         prompt_parameters: List[str] = config.prompt_parameters,
-        cache_size: int = 1000,
+        cache_size: int = 500,
     ):
         self.db_path = db_path
         self.prompt_parameters = prompt_parameters
+        self.cache_size = cache_size
+        if self.cache_size > 950:
+            logger.warning(
+                f"cache_size is set to {self.cache_size}. Sqlite has a limit of 999 variables in a single query and Pellets needs a bit of headroom to work with. Consider increasing cache_size to at least 950 to avoid issues."
+            )
+
         self.conn = sqlite3.connect(self.db_path)
         self.cursor = self.conn.cursor()
         self.__create_tables()
-        self.time = time
-        self.cache_size = cache_size
+
         self.response_stream_cache: List[ResponseStreamRecord] = []
 
     def __create_tables(self):
         # Tables will always contain:
-        # id: uuid.uuid4()
-        # prompt_arguments_id: uuid.uuid4() - foreign key to prompt_arguments in response
+        # id: INTEGER PRIMARY KEY
+        # prompt_arguments_id: INTEGER
 
         # Create the prompt_arguments table
         self.cursor.execute(
             f"""
             CREATE TABLE IF NOT EXISTS prompt_arguments (
-                id TEXT PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 model TEXT NOT NULL,
                 prompt TEXT NOT NULL,
                 parameters TEXT
@@ -67,10 +71,10 @@ class Pellet:
         self.cursor.execute(
             f"""
             CREATE TABLE IF NOT EXISTS response (
-                id TEXT PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 response TEXT NOT NULL,
-                prompt_arguments_id TEXT NOT NULL,
-                previous_response_id TEXT,
+                prompt_arguments_id INTEGER NOT NULL,
+                previous_response_id INTEGER,
                 done BOOLEAN DEFAULT FALSE,
                 FOREIGN KEY (prompt_arguments_id) REFERENCES prompt_arguments(id),
                 FOREIGN KEY (previous_response_id) REFERENCES response(id)
@@ -83,36 +87,34 @@ class Pellet:
         self,
         prompt_arguments: PromptArgumentsCreate,
     ) -> PromptArgumentsRecord:
-        id = str(uuid.uuid4())
         logger.debug(f"prompt_arguments: {prompt_arguments.model_dump()}")
         self.cursor.execute(
             f"""
-            INSERT INTO prompt_arguments (id, model, prompt,
-            parameters) VALUES (?, ?, ?, ?)
+            INSERT INTO prompt_arguments (model, prompt, parameters) VALUES (?, ?, ?)
             """,
             (
-                id,
                 prompt_arguments.model,
                 prompt_arguments.prompt,
                 json.dumps(prompt_arguments.parameters),
             ),
         )
         self.conn.commit()
-        return PromptArgumentsRecord(id=id, **prompt_arguments.model_dump())
+        return PromptArgumentsRecord(
+            id=self.cursor.lastrowid, **prompt_arguments.model_dump()
+        )
 
     def __insert_response(
         self,
         response: ResponseCreate,
     ) -> ResponseRecord:
-        id = str(uuid.uuid4())
         self.cursor.execute(
             f"""
-            INSERT INTO response (id, response, prompt_arguments_id) VALUES (?, ?, ?)
+            INSERT INTO response (response, prompt_arguments_id) VALUES (?, ?)
             """,
-            (id, response.response, str(response.prompt_arguments_id)),
+            (response.response, response.prompt_arguments_id),
         )
         self.conn.commit()
-        return ResponseRecord(id=id, **response.model_dump())
+        return ResponseRecord(id=self.cursor.lastrowid, **response.model_dump())
 
     def __log_prompt_arguments_and_response_non_streamed(
         self,
@@ -143,32 +145,35 @@ class Pellet:
 
         return prompt_arguments, response
 
-    def __insert_response_stream(
-        self,
-    ) -> List[ResponseStreamRecord]:
-        self.cursor.executemany(
-            f"""
-            INSERT INTO response (id, response, prompt_arguments_id,
-            previous_response_id, done) VALUES (?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    str(response.id),
-                    response.response,
-                    str(response.prompt_arguments_id),
-                    str(response.previous_response_id),
-                    response.done,
-                )
-                for response in self.response_stream_cache
-            ],
-        )
-        self.conn.commit()
-        self.response_stream_cache = []
 
-        return [
-            ResponseStreamRecord(id=response.id, **response.model_dump())
-            for response in self.response_stream_cache
-        ]
+    def __add_to_response_stream_transaction(self, response: ResponseStreamRecord) -> int:
+        self.cursor.execute(
+            """ 
+            INSERT INTO response (response, prompt_arguments_id, previous_response_id, done) 
+            VALUES (?, ?, ?, ?) 
+            """,
+            (
+                response.response, 
+                response.prompt_arguments_id, 
+                self.previous_response_id, 
+                response.done,
+            ),
+        )
+        self.previous_response_id = self.cursor.lastrowid
+        return self.previous_response_id
+    
+    def __insert_response_stream(self, response: ResponseStreamRecord) -> ResponseStreamRecord:
+        self.response_stream_cache.append(response)
+        response.previous_response_id = self.previous_response_id
+        self.previous_response_id = self.__add_to_response_stream_transaction(response)
+
+        if len(self.response_stream_cache) >= self.cache_size or response.done:
+            logger.debug(f"len(self.response_stream_cache): {len(self.response_stream_cache)}, response.done: {response.done}")
+            self.conn.commit()
+            self.cursor.execute("BEGIN TRANSACTION")
+            self.response_stream_cache = []
+        
+        return ResponseStreamRecord(id=self.previous_response_id, **response.model_dump())
 
     def __log_non_stream(self, with_results: bool = False) -> Callable:
         def decorator(func: Callable) -> Callable:
@@ -247,31 +252,26 @@ class Pellet:
                         )
                     ).id
                     self.response_stream_cache = []
-                    previous_response_id = prompt_arguments.id
+                    self.previous_response_id = None
                     for original_response in original_response_stream.iter_lines():
                         original_response_json = original_response.json()
-                        new_response_id = uuid.uuid4()
                         new_response = ResponseStreamCreate(
-                            id=new_response_id,
                             prompt_arguments_id=prompt_arguments.id,
-                            previous_response_id=previous_response_id,
+                            previous_response_id=self.previous_response_id,
                             response=original_response_json["response"],
-                            done=original_response_json["done"] == "true",
+                            done=original_response_json["done"],
                         )
-                        previous_response_id = str(new_response_id)
                         self.response_stream_cache.append(new_response)
                         if (
                             len(self.response_stream_cache) >= self.cache_size
-                            or original_response_json["done"] == "true"
+                            or original_response_json["done"]
                         ):
-                            self.__insert_response_stream()
+                            response_stream = self.__insert_response_stream()
 
                         if with_results:
                             yield original_response, {
                                 "prompt_arguments": prompt_arguments,
-                                "responses": ResponseStreamRecord(
-                                    id=new_response_id, **new_response.model_dump()
-                                ),
+                                
                             }
                         else:
                             yield original_response
@@ -279,6 +279,7 @@ class Pellet:
                 return wrapper
             else:
                 logger.debug(f"func: {func}, with_results: {with_results}")
+
                 def wrapper(*args, **kwargs) -> Generator:
                     logger.debug(f"args: {args}, kwargs: {kwargs}")
                     original_response_stream = func(*args, **kwargs)
@@ -300,33 +301,31 @@ class Pellet:
                         f"log response stream: {original_response_stream}, {type(original_response_stream)}"
                     )
                     self.response_stream_cache = []
-                    previous_response_id = prompt_arguments.id
+                    original_response = next(original_response_stream.iter_lines())
+                    original_response_json = json.loads(original_response)
+                    new_response = ResponseStreamCreate(
+                        prompt_arguments_id=prompt_arguments.id,
+                        previous_response_id=None,
+                        response=original_response_json["response"],
+                        done=original_response_json["done"],
+                    )
+                    self.previous_response_id = self.__insert_response(new_response).id
+                    self.cursor.execute("BEGIN TRANSACTION")
                     for original_response in original_response_stream.iter_lines():
                         original_response_json = json.loads(original_response)
-                        new_response_id = str(uuid.uuid4())
                         new_response = ResponseStreamCreate(
-                            id=new_response_id,
                             prompt_arguments_id=prompt_arguments.id,
-                            previous_response_id=previous_response_id,
+                            previous_response_id=self.previous_response_id,
                             response=original_response_json["response"],
-                            done=original_response_json["done"] == "true",
+                            done=original_response_json["done"],
                         )
-                        previous_response_id = new_response_id
-                        self.response_stream_cache.append(new_response)
-                        if (
-                            len(self.response_stream_cache) >= self.cache_size
-                            or original_response_json["done"] == "true"
-                        ):
-                            self.__insert_response_stream()
-
                         if with_results:
                             yield original_response, {
                                 "prompt_arguments": prompt_arguments,
-                                "response": ResponseStreamRecord(
-                                    **new_response.model_dump()
-                                ),
+                                "response": self.__insert_response_stream(new_response),
                             }
                         else:
+                            self.__insert_response_stream(new_response)
                             yield original_response
 
                 return wrapper
