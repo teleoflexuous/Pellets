@@ -1005,7 +1005,7 @@ def test_overhead(pellet, model, prompt, params, mock_generate, mock_generate_st
         lambda: pellet.log(with_results=False, stream=False)(lambda: mock_generate),
         number=1000,
     )  # 1000 iterations
-    # decorated_time_non_stream = f"{decorated_time_non_stream:.2e}"
+    decorated_time_non_stream = f"{decorated_time_non_stream:.2e}"
     logger.info(f"decorated_time_non_stream: {decorated_time_non_stream}")
 
     # Measure the average time of the original function via timeit (streamed), iterate over the response
@@ -1016,7 +1016,7 @@ def test_overhead(pellet, model, prompt, params, mock_generate, mock_generate_st
     original_time_stream = timeit.timeit(
         original_streamed, number=100
     )  # 1000 iterations
-    # original_time_stream = f"{original_time_stream:.2e}"
+    original_time_stream = f"{original_time_stream:.2e}"
     logger.info(f"original_time_stream: {original_time_stream}")
 
     def decorated_streamed():
@@ -1037,12 +1037,12 @@ def test_overhead(pellet, model, prompt, params, mock_generate, mock_generate_st
     decorated_time_stream = timeit.timeit(
         decorated_streamed, number=100
     )  # 1000 iterations
-    # decorated_time_stream = f"{decorated_time_stream:.2e}"
+    decorated_time_stream = f"{decorated_time_stream:.2e}"
     logger.info(f"decorated_time_stream: {decorated_time_stream}")
 
     logger.info(
-        f"overhead_non_stream: {float(decorated_time_non_stream) - float(original_time_non_stream)}"
+        f"overhead_non_stream: {(float(decorated_time_non_stream) - float(original_time_non_stream))/1000}"
     )
     logger.info(
-        f"overhead_stream: {float(decorated_time_stream) - float(original_time_stream)}"
+        f"overhead_stream: {(float(decorated_time_stream) - float(original_time_stream))/100}"
     )
