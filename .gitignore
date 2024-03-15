@@ -163,4 +163,4 @@ cython_debug/
 *tests/pickles/
 
 # Local db - pellets.db
-pellets.db
+*pellets.db
