@@ -1,0 +1,8 @@
+site_name: Pellets
+nav:
+  - Home: index.md
+theme:
+  name: material
+markdown_extensions:
+  - mdx_include
+  - pymdownx.snippets

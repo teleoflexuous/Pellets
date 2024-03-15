@@ -17,6 +17,13 @@ llama-cpp-python = "^0.2.51"
 pytest = "^8.0.2"
 
 
+
+[tool.poetry.group.docs.dependencies]
+mkdocs = "^1.5.3"
+mkdocs-material = "^9.5.13"
+mdx-include = "^1.4.2"
+pymdown-extensions = "^10.7.1"
+
 [tool.pytest.ini_options]
 log_cli = true
 log_cli_level = "DEBUG"
