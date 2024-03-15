@@ -38,15 +38,14 @@ class ResponseRecord(ResponseCreate):
     )
 
 
-class ResponseStreamCreate(ResponseCreate):
-    previous_response_id: int | None = Field(
-        default=None,
-        description="The unique identifier for the previous response",
-    )
-    done: bool = Field(description="Whether the response stream is done")
-
-
-class ResponseStreamRecord(ResponseStreamCreate):
+class ResponseStreamRecord(ResponseCreate):
     id: int = Field(
         description="The unique identifier for the response stream",
+    )
+    prompt_arguments_id: int = Field(
+        description="The unique identifier for the prompt arguments",
+    )
+    done: bool = Field(description="Whether the response stream is done")
+    previous_response_id: int | None = Field(
+        description="The unique identifier for the previous response",
     )

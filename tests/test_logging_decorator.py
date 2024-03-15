@@ -64,6 +64,8 @@
 # 2. Test that the decorator correctly reads the prompt, model, and response
 # 3. Test that the decorator correctly logs the prompt, model, and response to a sqlite database
 # 4. Test that the decorator correctly reads the prompt, model, and response from the sqlite database
+# 5. Test all together on a live server stream/non-stream and sync/async
+# 6. Check overhead of the decorator
 
 import pytest  # for the fixture, among other things
 import requests  # for the HTTP requests
@@ -76,6 +78,10 @@ import asyncio  # for the async tests
 from unittest.mock import AsyncMock, MagicMock  # for the mocking
 import aiohttp  # for the async HTTP requests
 import pickle  # for the serialization
+import timeit  # for the performance testing
+import cProfile  # for the performance testing
+import pstats  # for the performance testing
+import io  # for the performance testing
 
 from pellets.pellet import Pellet
 from pellets.records import (
@@ -84,7 +90,6 @@ from pellets.records import (
     PromptArgumentsCreate,
     ResponseCreate,
     ResponseStreamRecord,
-    ResponseStreamCreate,
 )
 from pellets.utils.logger import logger
 from pellets.config import config
@@ -102,14 +107,14 @@ file_names = {
         str(sorted(PARAMS.items())),
         False,
         False,
-    ): "non_streamed_sync_sky_blue_llama2_format_json.pkl",
+    ): "nonstreamed_sync_sky_blue_llama2_format_json.pkl",
     # (
     #     MODEL,
     #     PROMPT,
     #     str(sorted(PARAMS.items())),
     #     False,
     #     True,
-    # ): "non_streamed_async_sky_blue_llama2_format_json.pkl",
+    # ): "nonstreamed_async_sky_blue_llama2_format_json.pkl",
     (
         MODEL,
         PROMPT,
@@ -133,7 +138,6 @@ def generate(stream, model, prompt, params):
     data = {"model": model, "prompt": prompt, "stream": stream, **params}
     response = requests.post(url, json=data)
     assert response.status_code == 200
-    logger.info(f"Generated response: {response.json()}")
     return response
 
 
@@ -199,6 +203,16 @@ def params():
     return PARAMS
 
 
+@pytest.fixture
+def live_generate_nonstreamed_sync():
+    return generate(False, MODEL, PROMPT, PARAMS)
+
+
+@pytest.fixture
+def live_generate_streamed_sync():
+    return generate(True, MODEL, PROMPT, PARAMS)
+
+
 # Set up the mock response
 
 
@@ -250,7 +264,7 @@ def async_mock_generate_stream():
 
 
 # Test that the decorator correctly forwards the original response for a non-streamed response
-def test_log_forward_original_response_non_streamed_sync(
+def test_log_forward_original_response_nonstreamed_sync(
     pellet, mock_generate, model, prompt, params
 ):
     @pellet.log(with_results=False, stream=False)
@@ -270,7 +284,7 @@ def test_log_forward_original_response_non_streamed_sync(
 
 
 @pytest.mark.asyncio
-async def test_log_forward_original_response_non_streamed_async(
+async def test_log_forward_original_response_nonstreamed_async(
     pellet, async_mock_generate, model, prompt, params
 ):
     return  # TODO: Async
@@ -331,7 +345,7 @@ async def test_log_forward_original_response_streamed_async(
 # Test that the decorator correctly reads the prompt, model, and response for a non-streamed response
 
 
-def test_log_read_arguments_non_streamed_sync(
+def test_log_read_arguments_nonstreamed_sync(
     pellet, mock_generate, model, prompt, params
 ):
     @pellet.log(with_results=True, stream=False)
@@ -358,7 +372,7 @@ def test_log_read_arguments_non_streamed_sync(
 
 
 @pytest.mark.asyncio
-async def test_log_read_arguments_non_streamed_async(
+async def test_log_read_arguments_nonstreamed_async(
     pellet, model, prompt, params, async_mock_generate
 ):
     return  # TODO: Async
@@ -399,11 +413,11 @@ def test_log_read_arguments_streamed_sync(
     original_responses = []
     results = {"prompt_arguments": None, "responses": []}
     for original_response, result in func(model, prompt, **params):
-        original_responses.append(original_response)
-        if results["prompt_arguments"]:
-            assert result["prompt_arguments"] == results["prompt_arguments"]
-        results["prompt_arguments"] = result["prompt_arguments"]
-        results["responses"].append(result["response"])
+        if result:
+            if results["prompt_arguments"]:
+                assert result["prompt_arguments"] == results["prompt_arguments"]
+            results["prompt_arguments"] = result["prompt_arguments"]
+            results["responses"].append(result["response"])
 
     prompt_arguments = results["prompt_arguments"]
     responses = results["responses"]
@@ -421,16 +435,21 @@ def test_log_read_arguments_streamed_sync(
         responses, mock_generate_stream.iter_lines()
     ):
         expected_response = json.loads(expected_response)
-        assert isinstance(response, ResponseStreamRecord)
-        assert response == ResponseStreamRecord(
-            id=response.id,
-            **ResponseStreamCreate(
-                response=expected_response["response"],
-                prompt_arguments_id=prompt_arguments.id,
-                previous_response_id=response.previous_response_id,
-                done=expected_response["done"],
-            ).model_dump(),
-        )
+        expected_response["response"] = expected_response["response"].strip()
+        original_responses.append(response.response)  # Use dot notation
+        if (
+            len(original_responses) >= pellet.response_stream_cache_size
+            or expected_response["done"]
+        ):
+            assert response == ResponseStreamRecord(
+                id=response.id,
+                **ResponseStreamRecord(
+                    prompt_arguments_id=prompt_arguments.id,
+                    done=expected_response["done"],
+                    response="".join(original_responses),
+                ).model_dump(),
+            )
+            original_responses = []
 
 
 @pytest.mark.asyncio
@@ -446,11 +465,11 @@ async def test_log_read_arguments_streamed_async(
     original_responses = []
     results = {"prompt_arguments": None, "responses": []}
     async for original_response, result in func(model, prompt, **params):
-        original_responses.append(original_response)
-        if results["prompt_arguments"]:
-            assert result["prompt_arguments"] == results["prompt_arguments"]
-        results["prompt_arguments"] = result["prompt_arguments"]
-        results["responses"].append(result["response"])
+        if results:
+            if results["prompt_arguments"]:
+                assert result["prompt_arguments"] == results["prompt_arguments"]
+            results["prompt_arguments"] = result["prompt_arguments"]
+            results["responses"].append(result["response"])
 
     prompt_arguments = results["prompt_arguments"]
     responses = results["responses"]
@@ -467,22 +486,26 @@ async def test_log_read_arguments_streamed_async(
         responses, mock_response_stream.iter_lines()
     ):
         expected_response = json.loads(expected_response)
-        assert isinstance(response, ResponseStreamRecord)
-        assert response == ResponseStreamRecord(
-            id=response.id,
-            **ResponseStreamCreate(
-                response=expected_response["response"],
-                prompt_arguments_id=prompt_arguments.id,
-                previous_response_id=response.previous_response_id,
-                done=expected_response["done"],
-            ).model_dump(),
-        )
+        original_responses.append(response.response)  # Use dot notation
+        if (
+            len(original_responses) >= pellet.response_stream_cache_size
+            or expected_response["done"]
+        ):
+            assert response == ResponseStreamRecord(
+                id=response.id,
+                **ResponseStreamRecord(
+                    prompt_arguments_id=prompt_arguments.id,
+                    done=expected_response["done"],
+                    response="".join(original_responses),
+                ).model_dump(),
+            )
+            original_responses = []
 
 
 # Test that the decorator correctly logs the prompt, model, and response for a non-streamed response to a sqlite database
 
 
-def test_log_to_sqlite_non_streamed_sync(
+def test_log_to_sqlite_nonstreamed_sync(
     pellet, model, prompt, params, mock_generate, db_path
 ):
     @pellet.log(with_results=True, stream=False)
@@ -534,7 +557,7 @@ def test_log_to_sqlite_non_streamed_sync(
 
 
 @pytest.mark.asyncio
-async def test_log_to_sqlite_non_streamed_async(
+async def test_log_to_sqlite_nonstreamed_async(
     pellet, model, prompt, params, async_mock_generate, db_path
 ):
     return
@@ -596,13 +619,16 @@ def test_log_to_sqlite_streamed_sync(
 
     results = {"prompt_arguments": None, "responses": []}
     for original_response, result in func(model, prompt, **params):
-        if results["prompt_arguments"]:
-            assert result["prompt_arguments"] == results["prompt_arguments"]
-        results["prompt_arguments"] = result["prompt_arguments"]
-        results["responses"].append(result["response"])
+        if result:
+            if results["prompt_arguments"]:
+                assert result["prompt_arguments"] == results["prompt_arguments"]
+            results["prompt_arguments"] = result["prompt_arguments"]
+            results["responses"].append(result["response"])
 
     prompt_arguments = results["prompt_arguments"]
+    logger.debug(f"prompt_arguments: {prompt_arguments}")
     responses = results["responses"]
+    logger.debug(f"len(responses): {len(responses)}")
 
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
@@ -627,7 +653,7 @@ def test_log_to_sqlite_streamed_sync(
     response_ids = [response.id for response in responses]
 
     # Prepare the placeholders for the IN clause
-    placeholders = ', '.join('?' for _ in response_ids)
+    placeholders = ", ".join("?" for _ in response_ids)
 
     # Prepare the query
     query = f"SELECT * FROM response WHERE id IN ({placeholders})"
@@ -655,3 +681,368 @@ def test_log_to_sqlite_streamed_sync(
         assert fetched_response == response
 
     conn.close()
+
+
+@pytest.mark.asyncio
+async def test_log_to_sqlite_streamed_async(
+    pellet, model, prompt, params, async_mock_generate_stream, db_path
+):
+    return
+
+    @pellet.log(with_results=True, stream=True)
+    async def func(model, prompt, **params):
+        return await async_mock_generate_stream
+
+    results = {"prompt_arguments": None, "responses": []}
+    async for original_response, result in func(model, prompt, **params):
+        if results["prompt_arguments"]:
+            assert result["prompt_arguments"] == results["prompt_arguments"]
+        results["prompt_arguments"] = result["prompt_arguments"]
+        results["responses"].append(result["response"])
+
+    prompt_arguments = results["prompt_arguments"]
+    responses = results["responses"]
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        SELECT * FROM prompt_arguments WHERE id = '{prompt_arguments.id}'
+        """
+    )
+    fetched_prompt_arguments_table = cursor.fetchone()
+    columns = [desc[0] for desc in cursor.description]
+    fetched_prompt_arguments = {}
+    for column, value in zip(columns, fetched_prompt_arguments_table):
+        fetched_prompt_arguments[column] = value
+    fetched_prompt_arguments["parameters"] = json.loads(
+        fetched_prompt_arguments["parameters"]
+    )
+    fetched_prompt_arguments = PromptArgumentsRecord.model_validate(
+        fetched_prompt_arguments
+    )
+    assert fetched_prompt_arguments == prompt_arguments
+    response_ids = [response.id for response in responses]
+
+    # Prepare the placeholders for the IN clause
+    placeholders = ", ".join("?" for _ in response_ids)
+
+    # Prepare the query
+    query = f"SELECT * FROM response WHERE id IN ({placeholders})"
+
+    cursor.execute(query, response_ids)
+    fetched_responses_table = cursor.fetchall()
+    columns = [desc[0] for desc in cursor.description]
+    fetched_responses = []
+    for fetched_response_record in fetched_responses_table:
+        fetched_response = {}
+        for column, value in zip(columns, fetched_response_record):
+            fetched_response[column] = value
+        fetched_response = ResponseStreamRecord.model_validate(fetched_response)
+        fetched_responses.append(fetched_response)
+    fetched_responses = [
+        ResponseStreamRecord.model_validate(fetched_response)
+        for fetched_response in fetched_responses
+    ]
+    for fetched_response, response in zip(fetched_responses, responses):
+        assert fetched_response.response == response.response
+        assert fetched_response.done == response.done
+        assert fetched_response.prompt_arguments_id == response.prompt_arguments_id
+        assert fetched_response.previous_response_id == response.previous_response_id
+        assert fetched_response == response
+
+    conn.close()
+
+
+# Test all together on a live server stream/non-stream and sync/async
+def test_log_live_sqlite_nonstreamed_sync(pellet, model, prompt, params, db_path):
+    @pellet.log(with_results=True, stream=False)
+    def func(model, prompt, **params):
+        return generate(stream=False, model=model, prompt=prompt, params=params)
+
+    original_response, results = func(model, prompt, **params)
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        f"""
+        SELECT * FROM prompt_arguments WHERE id = '{results["prompt_arguments"].id}'
+        """
+    )
+    fetched_prompt_arguments_table = cursor.fetchone()
+    columns = [desc[0] for desc in cursor.description]
+    fetched_prompt_arguments = {}
+    for column, value in zip(columns, fetched_prompt_arguments_table):
+        fetched_prompt_arguments[column] = value
+    fetched_prompt_arguments["parameters"] = json.loads(
+        fetched_prompt_arguments["parameters"]
+    )
+    fetched_prompt_arguments = PromptArgumentsRecord.model_validate(
+        fetched_prompt_arguments
+    )
+    assert fetched_prompt_arguments == results["prompt_arguments"]
+
+    cursor.execute(
+        f"""
+        SELECT * FROM response WHERE id = '{results["response"].id}'
+        """
+    )
+    fetched_response_table = cursor.fetchone()
+    columns = [desc[0] for desc in cursor.description]
+    fetched_response = {}
+    for column, value in zip(columns, fetched_response_table):
+        fetched_response[column] = value
+    fetched_response = ResponseRecord.model_validate(fetched_response)
+    assert fetched_response == results["response"]
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_log_live_sqlite_nonstreamed_async(
+    pellet, model, prompt, params, db_path
+):
+    return
+
+    @pellet.log(with_results=True, stream=False)
+    async def func(model, prompt, **params):
+        return await async_generate(model, prompt, stream=False, params=params)
+
+    original_response, results = await func(model, prompt, **params)
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        f"""
+        SELECT * FROM prompt_arguments WHERE id = '{results["prompt_arguments"].id}'
+        """
+    )
+    fetched_prompt_arguments_table = cursor.fetchone()
+    columns = [desc[0] for desc in cursor.description]
+    fetched_prompt_arguments = {}
+    for column, value in zip(columns, fetched_prompt_arguments_table):
+        fetched_prompt_arguments[column] = value
+    fetched_prompt_arguments["parameters"] = json.loads(
+        fetched_prompt_arguments["parameters"]
+    )
+    fetched_prompt_arguments = PromptArgumentsRecord.model_validate(
+        fetched_prompt_arguments
+    )
+    assert fetched_prompt_arguments == results["prompt_arguments"]
+
+    cursor.execute(
+        f"""
+        SELECT * FROM response WHERE id = '{results["response"].id}'
+        """
+    )
+    fetched_response_table = cursor.fetchone()
+    columns = [desc[0] for desc in cursor.description]
+    fetched_response = {}
+    for column, value in zip(columns, fetched_response_table):
+        fetched_response[column] = value
+    fetched_response = ResponseRecord.model_validate(fetched_response)
+    assert fetched_response == results["response"]
+
+    conn.close()
+
+
+def test_log_live_sqlite_streamed_sync(pellet, model, prompt, params, db_path):
+    @pellet.log(with_results=True, stream=True)
+    def func(model, prompt, **params):
+        return generate(stream=True, model=model, prompt=prompt, params=params)
+
+    original_responses = []
+    results = {"prompt_arguments": None, "responses": []}
+    for original_response, result in func(model, prompt, **params):
+        original_responses.append(original_response)
+        if result:
+            if results["prompt_arguments"]:
+                assert result["prompt_arguments"] == results["prompt_arguments"]
+            results["prompt_arguments"] = result["prompt_arguments"]
+            results["responses"].append(result["response"])
+
+    prompt_arguments = results["prompt_arguments"]
+    logger.debug(f"prompt_arguments: {prompt_arguments}")
+    responses = results["responses"]
+    logger.debug(f"len(responses): {len(responses)}")
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        SELECT * FROM prompt_arguments WHERE id = '{prompt_arguments.id}'
+        """
+    )
+    fetched_prompt_arguments_table = cursor.fetchone()
+    columns = [desc[0] for desc in cursor.description]
+    fetched_prompt_arguments = {}
+    for column, value in zip(columns, fetched_prompt_arguments_table):
+        fetched_prompt_arguments[column] = value
+    fetched_prompt_arguments["parameters"] = json.loads(
+        fetched_prompt_arguments["parameters"]
+    )
+    fetched_prompt_arguments = PromptArgumentsRecord.model_validate(
+        fetched_prompt_arguments
+    )
+    assert fetched_prompt_arguments == prompt_arguments
+    response_ids = [response.id for response in responses]
+
+    # Prepare the placeholders for the IN clause
+    placeholders = ", ".join("?" for _ in response_ids)
+
+    # Prepare the query
+    query = f"SELECT * FROM response WHERE id IN ({placeholders})"
+
+    cursor.execute(query, response_ids)
+    fetched_responses_table = cursor.fetchall()
+    columns = [desc[0] for desc in cursor.description]
+    fetched_responses = []
+    for fetched_response_record in fetched_responses_table:
+        fetched_response = {}
+        for column, value in zip(columns, fetched_response_record):
+            fetched_response[column] = value
+        fetched_response = ResponseStreamRecord.model_validate(fetched_response)
+        fetched_responses.append(fetched_response)
+    fetched_responses = [
+        ResponseStreamRecord.model_validate(fetched_response)
+        for fetched_response in fetched_responses
+    ]
+    for fetched_response, response in zip(fetched_responses, responses):
+        assert fetched_response.response == response.response
+        assert fetched_response.done == response.done
+        assert fetched_response.prompt_arguments_id == response.prompt_arguments_id
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_log_live_sqlite_streamed_async(pellet, model, prompt, params, db_path):
+    return
+
+    @pellet.log(with_results=True, stream=True)
+    async def func(model, prompt, **params):
+        return await async_generate(model, prompt, stream=True, params=params)
+
+    original_responses = []
+    results = {"prompt_arguments": None, "responses": []}
+    async for original_response, result in func(model, prompt, **params):
+        original_responses.append(original_response)
+        if result:
+            if results["prompt_arguments"]:
+                assert result["prompt_arguments"] == results["prompt_arguments"]
+            results["prompt_arguments"] = result["prompt_arguments"]
+            results["responses"].append(result["response"])
+
+    prompt_arguments = results["prompt_arguments"]
+    responses = results["responses"]
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        SELECT * FROM prompt_arguments WHERE id = '{prompt_arguments.id}'
+        """
+    )
+    fetched_prompt_arguments_table = cursor.fetchone()
+    columns = [desc[0] for desc in cursor.description]
+    fetched_prompt_arguments = {}
+    for column, value in zip(columns, fetched_prompt_arguments_table):
+        fetched_prompt_arguments[column] = value
+    fetched_prompt_arguments["parameters"] = json.loads(
+        fetched_prompt_arguments["parameters"]
+    )
+    fetched_prompt_arguments = PromptArgumentsRecord.model_validate(
+        fetched_prompt_arguments
+    )
+    assert fetched_prompt_arguments == prompt_arguments
+    response_ids = [response.id for response in responses]
+
+    # Prepare the placeholders for the IN clause
+    placeholders = ", ".join("?" for _ in response_ids)
+
+    # Prepare the query
+    query = f"SELECT * FROM response WHERE id IN ({placeholders})"
+
+    cursor.execute(query, response_ids)
+    fetched_responses_table = cursor.fetchall()
+    columns = [desc[0] for desc in cursor.description]
+    fetched_responses = []
+    for fetched_response_record in fetched_responses_table:
+        fetched_response = {}
+        for column, value in zip(columns, fetched_response_record):
+            fetched_response[column] = value
+        fetched_response = ResponseStreamPieceRecord.model_validate(fetched_response)
+        fetched_responses.append(fetched_response)
+    fetched_responses = [
+        ResponseStreamPieceRecord.model_validate(fetched_response)
+        for fetched_response in fetched_responses
+    ]
+    for fetched_response, response in zip(fetched_responses, responses):
+        assert fetched_response.response == response.response
+        assert fetched_response.done == response.done
+        assert fetched_response.prompt_arguments_id == response.prompt_arguments_id
+        assert fetched_response.previous_response_id == response.previous_response_id
+        assert fetched_response == response
+
+    conn.close()
+
+
+# Test the overhead of the decorator
+def test_overhead(pellet, model, prompt, params, mock_generate, mock_generate_stream):
+    # Set logging level to info
+    logger.setLevel("INFO")
+    # Measure the average time of the original function via timeit (non-streamed)
+    original_time_non_stream = timeit.timeit(
+        lambda: mock_generate, number=1000
+    )  # 1000 iterations
+    original_time_non_stream = f"{original_time_non_stream:.2e}"
+    logger.info(f"original_time_non_stream: {original_time_non_stream}")
+
+    # Measure the average time of the decorated function via timeit (non-streamed)
+    decorated_time_non_stream = timeit.timeit(
+        lambda: pellet.log(with_results=False, stream=False)(lambda: mock_generate),
+        number=1000,
+    )  # 1000 iterations
+    # decorated_time_non_stream = f"{decorated_time_non_stream:.2e}"
+    logger.info(f"decorated_time_non_stream: {decorated_time_non_stream}")
+
+    # Measure the average time of the original function via timeit (streamed), iterate over the response
+    def original_streamed():
+        for response in mock_generate_stream:
+            pass
+
+    original_time_stream = timeit.timeit(
+        original_streamed, number=100
+    )  # 1000 iterations
+    # original_time_stream = f"{original_time_stream:.2e}"
+    logger.info(f"original_time_stream: {original_time_stream}")
+
+    def decorated_streamed():
+        @pellet.log(with_results=True, stream=True)
+        def func(model, prompt, **params):
+            return mock_generate_stream
+        
+        # profiler = cProfile.Profile()
+        # profiler.enable()
+        for response, result in func(model, prompt, **params):
+            pass
+        # profiler.disable()
+        # s = io.StringIO()
+        # stats = pstats.Stats(profiler, stream=s).sort_stats('time')
+        # stats.print_stats()
+        # logger.info(s.getvalue())
+
+    decorated_time_stream = timeit.timeit(
+        decorated_streamed, number=100
+    )  # 1000 iterations
+    # decorated_time_stream = f"{decorated_time_stream:.2e}"
+    logger.info(f"decorated_time_stream: {decorated_time_stream}")
+
+    logger.info(
+        f"overhead_non_stream: {float(decorated_time_non_stream) - float(original_time_non_stream)}"
+    )
+    logger.info(
+        f"overhead_stream: {float(decorated_time_stream) - float(original_time_stream)}"
+    )

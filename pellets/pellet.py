@@ -6,13 +6,17 @@
 
 import sqlite3
 import json
+import orjson
 import pydantic
 import asyncio
 import inspect
 from typing import Type, List, Callable, Generator, Union, Tuple, AsyncGenerator, Dict
 from itertools import chain
 import requests
+from queue import Queue
+from threading import Thread
 import time
+
 
 from pellets.config import config
 from pellets.records import (
@@ -20,10 +24,14 @@ from pellets.records import (
     ResponseRecord,
     PromptArgumentsCreate,
     ResponseCreate,
-    ResponseStreamCreate,
     ResponseStreamRecord,
 )
 from pellets.utils.logger import logger
+
+def read_ahead(stream, queue):
+    for line in stream.iter_lines():
+        queue.put(line)
+    queue.put(None)
 
 
 class Pellet:
@@ -31,21 +39,17 @@ class Pellet:
         self,
         db_path: str = config.db_path,
         prompt_parameters: List[str] = config.prompt_parameters,
-        cache_size: int = 500,
+        response_stream_cache_size: int = 500,
     ):
         self.db_path = db_path
         self.prompt_parameters = prompt_parameters
-        self.cache_size = cache_size
-        if self.cache_size > 950:
-            logger.warning(
-                f"cache_size is set to {self.cache_size}. Sqlite has a limit of 999 variables in a single query and Pellets needs a bit of headroom to work with. Consider increasing cache_size to at least 950 to avoid issues."
-            )
+        self.response_stream_cache_size = response_stream_cache_size
 
         self.conn = sqlite3.connect(self.db_path)
         self.cursor = self.conn.cursor()
         self.__create_tables()
 
-        self.response_stream_cache: List[ResponseStreamRecord] = []
+        self.response_stream_cache: List[str] = []
 
     def __create_tables(self):
         # Tables will always contain:
@@ -98,7 +102,6 @@ class Pellet:
                 json.dumps(prompt_arguments.parameters),
             ),
         )
-        self.conn.commit()
         return PromptArgumentsRecord(
             id=self.cursor.lastrowid, **prompt_arguments.model_dump()
         )
@@ -113,7 +116,6 @@ class Pellet:
             """,
             (response.response, response.prompt_arguments_id),
         )
-        self.conn.commit()
         return ResponseRecord(id=self.cursor.lastrowid, **response.model_dump())
 
     def __log_prompt_arguments_and_response_non_streamed(
@@ -133,6 +135,7 @@ class Pellet:
             },
         )
 
+        self.cursor.execute("BEGIN TRANSACTION")
         prompt_arguments = self.__insert_prompt_arguments(prompt_arguments)
         logger.debug(f"prompt_arguments: {prompt_arguments}, args_dict: {args_dict}")
         response = ResponseCreate(
@@ -142,38 +145,34 @@ class Pellet:
         )
 
         response = self.__insert_response(response)
+        self.conn.commit()
 
         return prompt_arguments, response
 
+    def insert_response_stream_cache(
+        self,
+        prompt_arguments: PromptArgumentsRecord,
+        previous_response_id: int = None,
+        done: bool = False,
+    ) -> ResponseStreamRecord:
+        # Integrate str in cache into a single string
+        response = "".join(self.response_stream_cache)
+        self.response_stream_cache = []
 
-    def __add_to_response_stream_transaction(self, response: ResponseStreamRecord) -> int:
+        # Insert the response into the database
         self.cursor.execute(
-            """ 
-            INSERT INTO response (response, prompt_arguments_id, previous_response_id, done) 
-            VALUES (?, ?, ?, ?) 
+            f"""
+            INSERT INTO response (response, prompt_arguments_id, previous_response_id, done) VALUES (?, ?, ?, ?)
             """,
-            (
-                response.response, 
-                response.prompt_arguments_id, 
-                self.previous_response_id, 
-                response.done,
-            ),
+            (response, prompt_arguments.id, previous_response_id, done),
         )
-        self.previous_response_id = self.cursor.lastrowid
-        return self.previous_response_id
-    
-    def __insert_response_stream(self, response: ResponseStreamRecord) -> ResponseStreamRecord:
-        self.response_stream_cache.append(response)
-        response.previous_response_id = self.previous_response_id
-        self.previous_response_id = self.__add_to_response_stream_transaction(response)
-
-        if len(self.response_stream_cache) >= self.cache_size or response.done:
-            logger.debug(f"len(self.response_stream_cache): {len(self.response_stream_cache)}, response.done: {response.done}")
-            self.conn.commit()
-            self.cursor.execute("BEGIN TRANSACTION")
-            self.response_stream_cache = []
-        
-        return ResponseStreamRecord(id=self.previous_response_id, **response.model_dump())
+        return ResponseStreamRecord(
+            id=self.cursor.lastrowid,
+            prompt_arguments_id=prompt_arguments.id,
+            done=done,
+            response=response,
+            previous_response_id=previous_response_id,
+        )
 
     def __log_non_stream(self, with_results: bool = False) -> Callable:
         def decorator(func: Callable) -> Callable:
@@ -233,6 +232,7 @@ class Pellet:
         def decorator(func) -> Callable:
             sig = inspect.signature(func)
             param_names = list(sig.parameters.keys())
+            previous_response_id = None
             if asyncio.iscoroutinefunction(func):
 
                 async def wrapper(*args, **kwargs) -> AsyncGenerator:
@@ -250,41 +250,43 @@ class Pellet:
                                 and k in self.prompt_parameters
                             },
                         )
-                    ).id
+                    )
                     self.response_stream_cache = []
-                    self.previous_response_id = None
+                    results = None
+                    original_response = next(original_response_stream.iter_lines())
+                    original_response_json = original_response.json()
+                    self.response_stream_cache.append(original_response["response"])
                     for original_response in original_response_stream.iter_lines():
                         original_response_json = original_response.json()
-                        new_response = ResponseStreamCreate(
-                            prompt_arguments_id=prompt_arguments.id,
-                            previous_response_id=self.previous_response_id,
-                            response=original_response_json["response"],
-                            done=original_response_json["done"],
-                        )
-                        self.response_stream_cache.append(new_response)
                         if (
-                            len(self.response_stream_cache) >= self.cache_size
+                            len(self.response_stream_cache)
+                            >= self.response_stream_cache_size
                             or original_response_json["done"]
                         ):
-                            response_stream = self.__insert_response_stream()
-
-                        if with_results:
-                            yield original_response, {
+                            response_stream = self.insert_response_stream_cache(
+                                prompt_arguments=prompt_arguments,
+                                previous_response_id=previous_response_id,
+                                done=original_response_json["done"],
+                            )
+                            results = {
                                 "prompt_arguments": prompt_arguments,
-                                
+                                "response": response_stream,
                             }
+                        if with_results:
+                            yield original_response, results
+                            results = None
                         else:
                             yield original_response
 
                 return wrapper
             else:
-                logger.debug(f"func: {func}, with_results: {with_results}")
-
+                # logger.debug(f"func: {func}, with_results: {with_results}")
                 def wrapper(*args, **kwargs) -> Generator:
-                    logger.debug(f"args: {args}, kwargs: {kwargs}")
+                    # logger.debug(f"args: {args}, kwargs: {kwargs}")
                     original_response_stream = func(*args, **kwargs)
                     args_dict = dict(zip(param_names, args))
                     args_dict.update(kwargs)
+                    self.cursor.execute("BEGIN TRANSACTION")
                     prompt_arguments = self.__insert_prompt_arguments(
                         PromptArgumentsCreate(
                             model=args_dict["model"],
@@ -297,37 +299,59 @@ class Pellet:
                             },
                         )
                     )
-                    logger.debug(
-                        f"log response stream: {original_response_stream}, {type(original_response_stream)}"
-                    )
+                    # logger.debug(
+                    #     f"log response stream: {original_response_stream}, {type(original_response_stream)}"
+                    # )
+                    time_create_prompt_arguments = time.time()
                     self.response_stream_cache = []
                     original_response = next(original_response_stream.iter_lines())
-                    original_response_json = json.loads(original_response)
-                    new_response = ResponseStreamCreate(
-                        prompt_arguments_id=prompt_arguments.id,
-                        previous_response_id=None,
-                        response=original_response_json["response"],
-                        done=original_response_json["done"],
-                    )
-                    self.previous_response_id = self.__insert_response(new_response).id
-                    self.cursor.execute("BEGIN TRANSACTION")
-                    for original_response in original_response_stream.iter_lines():
-                        original_response_json = json.loads(original_response)
-                        new_response = ResponseStreamCreate(
-                            prompt_arguments_id=prompt_arguments.id,
-                            previous_response_id=self.previous_response_id,
-                            response=original_response_json["response"],
-                            done=original_response_json["done"],
-                        )
-                        if with_results:
-                            yield original_response, {
-                                "prompt_arguments": prompt_arguments,
-                                "response": self.__insert_response_stream(new_response),
-                            }
-                        else:
-                            self.__insert_response_stream(new_response)
-                            yield original_response
+                    # original_response_json = json.loads(original_response.decode("utf-8"))
+                    # make it orjson
+                    original_response_json = orjson.loads(original_response)
+                    self.response_stream_cache.append(original_response_json["response"])
+                    previous_response_id = None
 
+                    queue = Queue(maxsize=100)
+                    thread = Thread(target=read_ahead, args=(original_response_stream, queue))
+                    thread.start()
+                    
+                    def process_responses(args, prompt_arguments, original_response, previous_response_id):
+                        results = None                           
+                        # original_response_json = json.loads(original_response.decode("utf-8"))
+                        original_response_json = orjson.loads(original_response)
+                        self.response_stream_cache.append(original_response_json["response"])
+                        if (
+                                len(self.response_stream_cache)
+                                >= self.response_stream_cache_size
+                                or original_response_json["done"]
+                            ):
+                            response_stream = self.insert_response_stream_cache(
+                                    prompt_arguments=prompt_arguments,
+                                    previous_response_id=previous_response_id,
+                                    done=original_response_json["done"],
+                                )
+                            results = {
+                                    "prompt_arguments": prompt_arguments,
+                                    "response": response_stream,
+                                }
+                            logger.debug(f"results: {results}")
+                            self.conn.commit()
+                            previous_response_id = response_stream.id
+                        return results
+
+                    if with_results:
+                        for original_response in iter(queue.get, None):
+                            if original_response is None:
+                                break
+                            results = process_responses(args, prompt_arguments, original_response, previous_response_id)
+                            yield original_response, results
+                    else:
+                        for original_response in iter(queue.get, None):
+                            if original_response is None:
+                                break
+                            process_responses(args, prompt_arguments, original_response, previous_response_id)
+                            yield original_response
+                    
                 return wrapper
 
         return decorator
@@ -338,6 +362,53 @@ class Pellet:
         else:
             return self.__log_non_stream(with_results=with_results)
 
-    def close(self):
-        self.conn.close()
-        logger.debug("Connection to sqlite database closed")
+    def __read_prompt_arguments(
+        self,
+        ids: List[int] = None,
+        models: List[str] = None,
+        prompts: List[str] = None,
+        params_dicts: List[Dict[str, str]] = None,
+    ) -> List[PromptArgumentsRecord]:
+        query = f"""
+        SELECT * FROM prompt_arguments
+        """
+
+        if ids:
+            query += f"WHERE id IN ({', '.join([str(i) for i in ids])})"
+        if models:
+            query += f"WHERE model IN ({', '.join([str(m) for m in models])})"
+        if prompts:
+            query += f"WHERE prompt IN ({', '.join([str(p) for p in prompts])})"
+        if params_dicts:
+            params_dicts = [json.dumps(p) for p in sorted(params_dicts)]
+            query += (
+                f"WHERE parameters IN ({', '.join([str(p) for p in params_dicts])})"
+            )
+
+        self.cursor.execute(query)
+        return [PromptArgumentsRecord(*row) for row in self.cursor.fetchall()]
+
+    def __read_response(
+        self,
+        ids: List[int] = None,
+        prompt_arguments_ids: List[int] = None,
+        previous_response_ids: List[int] = None,
+        done: bool = None,
+    ) -> List[ResponseRecord]:
+        query = f"""
+        SELECT * FROM response
+        """
+
+        if ids:
+            query += f"WHERE id IN ({', '.join([str(i) for i in ids])})"
+        if prompt_arguments_ids:
+            query += f"WHERE prompt_arguments_id IN ({', '.join([str(p) for p in prompt_arguments_ids])})"
+        if previous_response_ids:
+            query += f"WHERE previous_response_id IN ({', '.join([str(p) for p in previous_response_ids])})"
+        if done is not None:
+            query += f"WHERE done = {done}"
+
+        self.cursor.execute(query)
+        return [ResponseRecord(*row) for row in self.cursor.fetchall()]
+
+    # def __read_response_stream(self, ids: List[int] = None, prompt_arguments_ids: List[int] = None, previous_response_ids: List[int] = None, done: bool = None) -> List[ResponseStreamRecord]:
